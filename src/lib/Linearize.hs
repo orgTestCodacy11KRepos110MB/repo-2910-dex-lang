@@ -15,11 +15,11 @@ import GHC.Stack
 
 import Name
 import Builder
+import Err
 import Syntax
 import MTL1
 import QueryType
 import Util (bindM2)
-import PPrint
 
 -- === linearization monad ===
 

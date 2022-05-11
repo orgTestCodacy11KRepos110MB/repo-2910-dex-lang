@@ -196,3 +196,15 @@ function render(renderMode) {
         };
     }
 }
+
+Array.from(document.getElementsByClassName('code-span')).forEach((span) => {
+  span.addEventListener('mouseover', function( event ) {
+    // highlight the mouseenter target
+    event.target.style.color = 'purple';
+
+    // reset the color after a short delay
+    setTimeout(function() {
+      event.target.style.color = '';
+    }, 500);
+  }, false);
+});

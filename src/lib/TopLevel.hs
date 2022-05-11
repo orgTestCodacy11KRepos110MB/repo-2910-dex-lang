@@ -42,6 +42,7 @@ import LLVMExec
 import PPrint (pprintCanonicalized)
 import Util (measureSeconds, File (..), readFileWithHash)
 import Serialize (HasPtrs (..), pprintVal, getDexString, takePtrSnapshot, restorePtrSnapshot)
+import TraverseContexts
 
 import Name
 import Parser
@@ -178,11 +179,12 @@ evalSourceBlock :: (Topper m, Mut n)
                 => ModuleSourceName -> SourceBlock -> m n Result
 evalSourceBlock mname block = do
   result <- withCompileTime do
-     (maybeErr, logs) <- catchLogsAndErrs $
+     (maybeBlock, logs) <- catchLogsAndErrs $
        withPassCtx (PassCtx (blockRequiresBench block)
                             (passLogFilter $ sbLogLevel block)) $
          evalSourceBlock' mname block
-     return $ Result logs maybeErr
+     -- FIXME: Make sure SourceBlock is plumbed through.
+     return (Result logs (Success ()) maybeBlock)
   case resultErrs result of
     Failure _ -> case sbContents block of
       EvalUDecl decl -> emitSourceMap $ uDeclErrSourceMap mname decl
@@ -191,15 +193,18 @@ evalSourceBlock mname block = do
   return $ filterLogs block $ addResultCtx block result
 {-# SCC evalSourceBlock #-}
 
-evalSourceBlock' :: (Topper m, Mut n) => ModuleSourceName -> SourceBlock -> m n ()
+evalSourceBlock' :: (Topper m, Mut n) => ModuleSourceName -> SourceBlock -> m n SourceBlock
 evalSourceBlock' mname block = case sbContents block of
-  EvalUDecl decl -> execUDecl mname decl
+  EvalUDecl decl -> do
+    execUDecl mname decl
+    -- return (EvalUDecl (addContextIds decl))
+    return block { sbContents = EvalUDecl (addContextIds decl) }
   Command cmd expr -> case cmd of
     EvalExpr fmt -> do
       annExpr <- case fmt of
         Printed -> return expr
         RenderHtml -> return $ addTypeAnn expr $ referTo "String"
-      val <- evalUExpr annExpr
+      (val, expr') <- evalUExpr annExpr
       case fmt of
         Printed -> do
           s <- pprintVal val
@@ -207,6 +212,7 @@ evalSourceBlock' mname block = case sbContents block of
         RenderHtml -> do
           s <- getDexString val
           logTop $ HtmlOut s
+      return block { sbContents = Command cmd expr' }
     ExportFun _ -> error "not implemented"
     --   f <- evalUModuleVal v m
     --   void $ traverseLiterals f \val -> case val of
@@ -215,9 +221,10 @@ evalSourceBlock' mname block = case sbContents block of
     --     _ -> return $ Con $ Lit val
     --   logTop $ ExportedFun name f
     GetType -> do  -- TODO: don't actually evaluate it
-      val <- evalUExpr expr
+      (val, _) <- evalUExpr expr
       ty <- getType val
       logTop $ TextOut $ pprintCanonicalized ty
+      return block
   DeclareForeign fname (UAnnBinder b uty) -> do
     ty <- evalUType uty
     asFFIFunType ty >>= \case
@@ -228,23 +235,39 @@ evalSourceBlock' mname block = case sbContents block of
         let hint = getNameHint b
         vImp  <- emitImpFunBinding hint $ FFIFunction impFunTy fname
         vCore <- emitBinding hint (AtomNameBinding $ FFIFunBound naryPiTy vImp)
-        UBindSource sourceName <- return b
+        UBindSource _ sourceName <- return b
         emitSourceMap $ SourceMap $
           M.singleton sourceName [ModuleVar mname (Just $ UAtomVar vCore)]
+    return block
   GetNameType v -> do
     ty <- sourceNameType v
     logTop $ TextOut $ pprintCanonicalized ty
+    return block
+  {-
   ImportModule moduleName -> importModule moduleName
   QueryEnv query -> void $ runEnvQuery query $> UnitE
   ProseBlock _ -> return ()
   CommentLine  -> return ()
   EmptyLines   -> return ()
   UnParseable _ s -> throw ParseErr s
+  -}
+  ImportModule moduleName -> importModule moduleName >> return block
+  QueryEnv query -> void (runEnvQuery query $> UnitE) >> return block
+  ProseBlock _ -> return block
+  CommentLine  -> return block
+  EmptyLines   -> return block
+  UnParseable _ s -> throw ParseErr s >> return block
   where
+    {-
     addTypeAnn :: UExpr n -> UExpr n -> UExpr n
     addTypeAnn e = WithSrcE Nothing . UTypeAnn e
     referTo :: SourceName -> UExpr VoidS
     referTo = WithSrcE Nothing . UVar . SourceName
+    -}
+    addTypeAnn :: UExpr n -> UExpr n -> UExpr n
+    addTypeAnn e = WithSrcE emptySrcPosCtx . UTypeAnn e
+    referTo :: SourceName -> UExpr VoidS
+    referTo = WithSrcE emptySrcPosCtx . UVar . SourceName emptySrcPosCtx
 
 runEnvQuery :: Topper m => EnvQuery -> m n ()
 runEnvQuery query = do
@@ -274,10 +297,10 @@ blockRequiresBench block = case sbLogLevel block of
   _            -> False
 
 filterLogs :: SourceBlock -> Result -> Result
-filterLogs block (Result outs err) = let
+filterLogs block (Result outs err block') = let
   (logOuts, requiredOuts) = partition isLogInfo outs
   outs' = requiredOuts ++ processLogs (sbLogLevel block) logOuts
-  in Result outs' err
+  in Result outs' err block'
 
 -- returns a toposorted list of the module's transitive dependencies (including
 -- the module itself) excluding those provided in the set of already known
@@ -422,12 +445,21 @@ evalUType ty = do
   renamed <- logPass RenamePass $ renameSourceNamesUExpr ty
   checkPass TypePass $ checkTopUType renamed
 
-evalUExpr :: (Topper m, Mut n) => UExpr VoidS -> m n (Atom n)
+-- Note: main top level functions are evalUExpr and execUDecl
+
+-- evalUExpr :: (Topper m, Mut n) => UExpr VoidS -> m n (Atom n)
+evalUExpr :: (Topper m, Mut n) => UExpr VoidS -> m n (Atom n, UExpr VoidS)
 evalUExpr expr = do
   logTop $ PassInfo Parse $ pprint expr
+  -- Idea: insert extra passes here to add unique expression ids.
+  -- Starting approach: add Maybe SpanId field, populate in a pass.
+  -- Eventually: learn from "Trees that Grow" and add metadata type parameter to
+  -- UExpr.
+  let annotatedExpr = addContextIds expr
   renamed <- logPass RenamePass $ renameSourceNamesUExpr expr
   typed <- checkPass TypePass $ inferTopUExpr renamed
-  evalBlock typed
+  result <- evalBlock typed
+  return (result, annotatedExpr)
 {-# SCC evalUExpr #-}
 
 evalBlock :: (Topper m, Mut n) => Block n -> m n (Atom n)
@@ -531,8 +563,8 @@ evalBackend block = do
 
 withCompileTime :: MonadIO m => m Result -> m Result
 withCompileTime m = do
-  (Result outs err, t) <- measureSeconds m
-  return $ Result (outs ++ [TotalTime t]) err
+  (Result outs err block, t) <- measureSeconds m
+  return $ Result (outs ++ [TotalTime t]) err block
 
 checkPass :: (Topper m, Pretty (e n), CheckableE e)
           => PassName -> m n (e n) -> m n (e n)
@@ -550,8 +582,8 @@ checkPass name cont = do
   return result
 
 addResultCtx :: SourceBlock -> Result -> Result
-addResultCtx block (Result outs errs) =
-  Result outs (addSrcTextContext (sbOffset block) (sbText block) errs)
+addResultCtx block (Result outs errs block') =
+  Result outs (addSrcTextContext (sbOffset block) (sbText block) errs) block'
 
 logTop :: TopLogger m => Output -> m ()
 logTop x = logIO [x]

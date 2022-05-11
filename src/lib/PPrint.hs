@@ -249,12 +249,13 @@ instance PrettyPrec (Atom n) where
     TC  e -> prettyPrec e
     Con e -> prettyPrec e
     Eff e -> atPrec ArgPrec $ p e
-    DataCon name _ _ _ xs -> case xs of
+    DataCon (SourceNameWithPos _ name) _ _ _ xs -> case xs of
       [] -> atPrec ArgPrec $ p name
       [l, r] | Just sym <- fromInfix (fromString name) -> atPrec ArgPrec $ align $ group $
         parens $ flatAlt " " "" <> pApp l <> line <> p sym <+> pApp r
       _ ->  atPrec LowestPrec $ pAppArg (p name) xs
-    TypeCon name _ (DataDefParams params _) -> case params of
+    -- TypeCon name _ (DataDefParams params _) -> case params of
+    TypeCon (SourceNameWithPos _ name) _ (DataDefParams params _) -> case params of
       [] -> atPrec ArgPrec $ p name
       [l, r] | Just sym <- fromInfix (fromString name) ->
         atPrec ArgPrec $ align $ group $
@@ -556,21 +557,23 @@ instance Pretty Output where
   pretty (TotalTime t)   = "Total (s): " <+> p t <+> "  (eval + compile)"
   pretty (MiscLog s) = p s
 
+instance Pretty SourceNameWithPos where
+  pretty (SourceNameWithPos _ x) = p x
 
 instance Pretty PassName where
   pretty x = p $ show x
 
 instance Pretty Result where
-  pretty (Result outs r) = vcat (map pretty outs) <> maybeErr
+  pretty (Result outs r _) = vcat (map pretty outs) <> maybeErr
     where maybeErr = case r of Failure err -> p err
                                Success () -> mempty
 
 instance Color c => Pretty (UBinder c n l) where pretty = prettyFromPrettyPrec
 instance Color c => PrettyPrec (UBinder c n l) where
   prettyPrec b = atPrec ArgPrec case b of
-    UBindSource v -> p v
-    UIgnore       -> "_"
-    UBind v _     -> p v
+    UBindSource _ v -> p v
+    UIgnore         -> "_"
+    UBind _ v _     -> p v
 
 instance PrettyE e => Pretty (WithSrcE e n) where
   pretty (WithSrcE _ x) = p x
@@ -585,8 +588,8 @@ instance PrettyPrecB b => PrettyPrec (WithSrcB b n l) where
   prettyPrec (WithSrcB _ x) = prettyPrec x
 
 instance PrettyE e => Pretty (SourceNameOr e n) where
-  pretty (SourceName   v) = p v
-  pretty (InternalName v _) = p v
+  pretty (SourceName _ v) = p v
+  pretty (InternalName _ v _) = p v
 
 instance Pretty (ULamExpr n) where pretty = prettyFromPrettyPrec
 instance PrettyPrec (ULamExpr n) where
@@ -984,10 +987,12 @@ instance Pretty RWS where
 
 printLitBlock :: Pretty block => Bool -> block -> Result -> String
 printLitBlock isatty block result = pprint block ++ printResult isatty result
+-- printLitBlock isatty block (Result outs result _) =
+--   pprint block ++ concat (map (printOutput isatty) outs) ++ printResult isatty result
 
 printResult :: Bool -> Result -> String
-printResult isatty (Result outs errs) =
-  concat (map printOutput outs) ++ case errs of
+printResult isatty (Result outs errs _) =
+  concatMap printOutput outs ++ case errs of
     Success ()  -> ""
     Failure err -> addColor isatty Red $ addPrefix ">" $ pprint err
   where
@@ -1010,7 +1015,7 @@ toJSONStr :: ToJSON a => a -> String
 toJSONStr = B.unpack . encode
 
 instance ToJSON Result where
-  toJSON (Result outs err) = object (outMaps <> errMaps)
+  toJSON (Result outs err _) = object (outMaps <> errMaps)
     where
       errMaps = case err of
         Failure e   -> ["error" .= String (fromString $ pprint e)]

@@ -692,15 +692,20 @@ buildUnaryAtomAlt ty body = do
     body v
 
 buildNewtype :: ScopableBuilder m
-             => SourceName
+             => SourceNameWithPos
              -> EmptyAbs (Nest Binder) n
              -> (forall l. DExt n l => [AtomName l] -> m l (Type l))
              -> m n (DataDef n)
-buildNewtype name paramBs body = do
+buildNewtype nameWithPos@(SourceNameWithPos pos name) paramBs body = do
   Abs paramBs' argBs <- buildNaryAbs paramBs \params -> do
     ty <- body params
     singletonBinderNest noHint ty
-  return $ DataDef name (DataDefBinders paramBs' Empty) [DataConDef ("mk" <> name) argBs]
+  -- return $ DataDef name (DataDefBinders paramBs' Empty) [DataConDef ("mk" <> name) argBs]
+  return $ DataDef nameWithPos (DataDefBinders paramBs' Empty) [DataConDef (SourceNameWithPos pos ("mk" <> name)) argBs]
+  {-
+  -- return $ DataDef name paramBs' [DataConDef ("mk" <> name) argBs]
+  return $ DataDef nameWithPos paramBs' [DataConDef (SourceNameWithPos pos ("mk" <> name)) argBs]
+  -}
 
 fromNewtype :: [DataConDef n]
             -> Maybe (Type n)

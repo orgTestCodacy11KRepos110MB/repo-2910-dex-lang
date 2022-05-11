@@ -57,7 +57,7 @@ runMode evalMode opts = case evalMode of
     env <- loadCache
     (litProg, finalEnv) <- runTopperM opts env do
       source <- liftIO $ T.readFile fname
-      evalSourceText source (printIncrementalSource fmt) \result@(Result _ errs) -> do
+      evalSourceText source (printIncrementalSource fmt) \result@(Result _ _ errs) -> do
         printIncrementalResult fmt result
         return case (onErr, errs) of (HaltOnErr, Failure _) -> False; _ -> True
     printFinal fmt litProg
@@ -74,7 +74,7 @@ runMode evalMode opts = case evalMode of
       evalBlockRepl block = do
         result <- evalSourceBlockRepl block
         case result of
-          Result [] (Success ()) -> return ()
+          Result [] (Success ()) _ -> return ()
           _ -> liftIO $ putStrLn $ pprint result
   ClearCache -> clearCache
 #ifdef DEX_LIVE
@@ -96,6 +96,13 @@ printIncrementalSource fmt sb = case fmt of
 #ifdef DEX_LIVE
   HTMLDoc -> return ()
 #endif
+
+evalBlockRepl :: (Topper m, Mut n) => SourceBlock -> m n ()
+evalBlockRepl block = do
+  result <- evalSourceBlockRepl block
+  case result of
+    Result [] (Success ()) _ -> return ()
+    _ -> liftIO $ putStrLn $ pprint result
 
 printIncrementalResult :: DocFmt -> Result -> IO ()
 printIncrementalResult fmt result = case fmt of

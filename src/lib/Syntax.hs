@@ -49,7 +49,7 @@ module Syntax (
     mkBundle, mkBundleTy, BundleDesc,
     BaseMonoidP (..), BaseMonoid, getIntLit, getFloatLit, sizeOf, ptrSize,
     SubstVal (..), AtomName, DataDefName, ClassName, MethodName, InstanceName, AtomSubstVal,
-    SourceName, SourceNameOr (..), UVar (..), UBinder (..), uBinderSourceName,
+    SourceName, SourceNameWithPos (..), SourceNameOr (..), UVar (..), UBinder (..), uBinderSourceName,
     UExpr, UExpr' (..), UConDef, UDataDef (..), UDataDefTrail (..), UDecl (..),
     UFieldRowElems, UFieldRowElem (..),
     ULamExpr (..), UPiExpr (..), UTabLamExpr (..), UTabPiExpr (..), IxBinder,
@@ -135,7 +135,9 @@ type LitProg = [(SourceBlock, Result)]
 
 data Result = Result
                 { resultOutputs :: [Output]
-                , resultErrs    :: Except () }
+                , resultErrs    :: Except ()
+                -- , resultSourceBlock :: SourceBlock }
+                , resultSourceBlock :: Except SourceBlock }
               deriving (Show, Eq)
 
 type BenchStats = (Int, Double) -- number of runs, total benchmarking time

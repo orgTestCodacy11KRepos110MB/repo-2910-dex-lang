@@ -56,8 +56,12 @@ data Atom (n::S) =
  | DepPairTy (DepPairType n)
  | DepPair   (Atom n) (Atom n) (DepPairType n)
    -- SourceName is purely for printing
+ {-
  | DataCon SourceName (DataDefName n) (DataDefParams n) Int [Atom n]
  | TypeCon SourceName (DataDefName n) (DataDefParams n)
+ -}
+ | DataCon SourceNameWithPos (DataDefName n) (DataDefParams n) Int [Atom n]
+ | TypeCon SourceNameWithPos (DataDefName n) (DataDefParams n)
  | DictCon (DictExpr n)
  | DictTy  (DictType n)
  | IxTy    (IxType n)
@@ -135,11 +139,17 @@ data FieldRowElem (n::S)
 data DataDef n where
   -- The `SourceName` is just for pretty-printing. The actual alpha-renamable
   -- binder name is in UExpr and Env
-  DataDef :: SourceName -> DataDefBinders n l -> [DataConDef l] -> DataDef n
+  -- DataDef :: SourceName -> DataDefBinders n l -> [DataConDef l] -> DataDef n
+  DataDef :: SourceNameWithPos -> DataDefBinders n l -> [DataConDef l] -> DataDef n
+  {-
+  -- DataDef :: SourceName -> Nest Binder n l -> [DataConDef l] -> DataDef n
+  DataDef :: SourceNameWithPos -> Nest Binder n l -> [DataConDef l] -> DataDef n
+  -}
 
 -- As above, the `SourceName` is just for pretty-printing
 data DataConDef n =
-  DataConDef SourceName (EmptyAbs (Nest Binder) n)
+  -- DataConDef SourceName (EmptyAbs (Nest Binder) n)
+  DataConDef SourceNameWithPos (EmptyAbs (Nest Binder) n)
   deriving (Show, Generic)
 
 data DataDefBinders n l where
@@ -797,6 +807,16 @@ instance GenericE DataDefParams where
   toE   (PairE (ListE xs) (ListE ys)) = DataDefParams xs ys
   {-# INLINE toE #-}
 
+{-
+instance GenericE DataDef where
+  -- type RepE DataDef = PairE (LiftE SourceName) (Abs (Nest Binder) (ListE DataConDef))
+  type RepE DataDef = PairE (LiftE SourceNameWithPos) (Abs (Nest Binder) (ListE DataConDef))
+  fromE (DataDef name bs cons) = PairE (LiftE name) (Abs bs (ListE cons))
+  {-# INLINE fromE #-}
+  toE   (PairE (ListE xs) (ListE ys)) = DataDefParams xs ys
+  {-# INLINE toE #-}
+-}
+
 -- We ignore the dictionary parameters because we assume coherence
 instance AlphaEqE DataDefParams where
   alphaEqE (DataDefParams params _) (DataDefParams params' _) =
@@ -812,7 +832,12 @@ instance SubstE Name         DataDefParams
 instance SubstE AtomSubstVal DataDefParams
 
 instance GenericE DataDef where
-  type RepE DataDef = PairE (LiftE SourceName) (Abs DataDefBinders (ListE DataConDef))
+  -- type RepE DataDef = PairE (LiftE SourceName) (Abs DataDefBinders (ListE DataConDef))
+  -- fromE (DataDef sourceName bs cons) = PairE (LiftE sourceName) (Abs bs (ListE cons))
+  -- {-# INLINE fromE #-}
+  -- toE   (PairE (LiftE sourceName) (Abs bs (ListE cons))) = DataDef sourceName bs cons
+  -- {-# INLINE toE #-}
+  type RepE DataDef = PairE (LiftE SourceNameWithPos) (Abs DataDefBinders (ListE DataConDef))
   fromE (DataDef sourceName bs cons) = PairE (LiftE sourceName) (Abs bs (ListE cons))
   {-# INLINE fromE #-}
   toE   (PairE (LiftE sourceName) (Abs bs (ListE cons))) = DataDef sourceName bs cons
@@ -828,7 +853,7 @@ instance AlphaEqE DataDef
 instance AlphaHashableE DataDef
 
 instance GenericE DataConDef where
-  type RepE DataConDef = PairE (LiftE SourceName) (Abs (Nest Binder) UnitE)
+  type RepE DataConDef = PairE (LiftE SourceNameWithPos) (Abs (Nest Binder) UnitE)
   fromE (DataConDef name ab) = PairE (LiftE name) ab
   {-# INLINE fromE #-}
   toE   (PairE (LiftE name) ab) = DataConDef name ab
@@ -933,11 +958,11 @@ instance GenericE Atom where
             ) (EitherE6
   {- DepPairTy -}  DepPairType
   {- DepPair -}    ( Atom `PairE` Atom `PairE` DepPairType)
-  {- DataCon -}    ( LiftE (SourceName, Int)   `PairE`
+  {- DataCon -}    ( LiftE (SourceNameWithPos, Int)   `PairE`
                      DataDefName               `PairE`
                      DataDefParams               `PairE`
                      ListE Atom )
-  {- TypeCon -}    ( LiftE SourceName `PairE` DataDefName `PairE` DataDefParams)
+  {- TypeCon -}    ( LiftE SourceNameWithPos `PairE` DataDefName `PairE` DataDefParams)
   {- DictCon  -}   DictExpr
   {- DictTy  -}    DictType
             ) (EitherE5

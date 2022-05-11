@@ -24,7 +24,6 @@ import qualified Data.Map.Strict       as M
 import Data.Tuple
 import Data.Functor
 import Data.Foldable
-import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Scientific as Scientific
 import Data.Maybe (fromMaybe)
 import Data.Void
@@ -37,10 +36,8 @@ import qualified Text.Megaparsec.Debug
 import Err
 import LabeledItems
 import Name
+import Syntax
 import Util (File (..))
-
-import Types.Source
-import Types.Primitives
 
 -- canPair is used for the ops (,) (|) (&) which should only appear inside
 -- parentheses (to avoid conflicts with records and other syntax)
@@ -196,13 +193,13 @@ explicitCommand = do
   cmdName <- char ':' >> nameString
   cmd <- case cmdName of
     "p"       -> return $ EvalExpr Printed
-    "t"       -> return $ GetType
+    "t"       -> return GetType
     "html"    -> return $ EvalExpr RenderHtml
     "export"  -> ExportFun <$> nameString
     _ -> fail $ "unrecognized command: " ++ show cmdName
   e <- blockOrExpr <* eolf
   return $ case (e, cmd) of
-    (WithSrcE _ (UVar (SourceName v)), GetType) -> GetNameType v
+    (WithSrcE _ (UVar (SourceName _ v)), GetType) -> GetNameType v
     _ -> Command cmd e
 
 -- === uexpr ===
@@ -254,7 +251,7 @@ uLabel = withSrc $ do
 uString :: Lexer (UExpr VoidS)
 uString = do
   (s, pos) <- withPos $ strLit
-  let addSrc = WithSrcE (Just pos)
+  let addSrc = WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo)
   let cs = map (addSrc . charExpr) s
   return $ mkApp (addSrc "to_list") $ addSrc $ UTabCon cs
 
@@ -286,17 +283,17 @@ interfaceDef :: Parser (UDecl VoidS VoidS)
 interfaceDef = do
   keyWord InterfaceKW
   superclasses <- superclassConstraints
-  (tyConName, tyConParams) <- tyConDef
+  (SourceNameWithPos tyConPos tyConName, tyConParams) <- tyConDef
   (methodNames, methodTys) <- unzip <$> onePerLine do
-    v <- anyName
+    (v, pos) <- withPos anyName
     explicit <- many anyName
     ty <- annot uType
-    return (fromString v, UMethodType (Left $ explicit) ty)
+    return (UBindSource (fromPos pos) v, UMethodType (Left $ explicit) ty)
   let methodNames' :: Nest (UBinder MethodNameC) VoidS VoidS
-      methodNames' = toNest methodNames
+      methodNames' = toNestParsed methodNames
   let tyConParams' = tyConParams
   return $ UInterface tyConParams' superclasses methodTys
-                      (fromString tyConName) methodNames'
+                      (UBindSource tyConPos tyConName) methodNames'
 
 toNest :: (IsString (a VoidS VoidS)) => [String] -> Nest a VoidS VoidS
 toNest = toNestParsed . map fromString
@@ -315,29 +312,35 @@ toPairB s1 s2 = PairB parse1 parse2 where
 dataDef :: Parser (UDecl VoidS VoidS)
 dataDef = do
   keyWord DataKW
-  tyCon <- tyConDef
+  tyCon@(SourceNameWithPos tyConPos tyConName, _) <- tyConDef
   ifaces <- (lookAhead lBracket >> brackets multiIfaceBinder) <|> pure []
   sym "="
   dataCons <- onePerLine dataConDef
   return $ UDataDefDecl
     (UDataDef tyCon (toNestParsed ifaces) $
       map (\(nm, cons) -> (nm, UDataDefTrail cons)) dataCons)
-    (fromString $ fst tyCon)
-    (toNest $ map (fromString . fst) $ dataCons)
+    -- (fromString $ fst tyCon)
+    -- (toNest $ map (fromString . fst) $ dataCons)
+    (UBindSource tyConPos tyConName)
+    (toNestParsed $ map (\((SourceNameWithPos pos nm), _) -> UBindSource pos nm) dataCons)
 
 tyConDef :: Parser (UConDef VoidS VoidS)
 tyConDef = do
-  con <- upperName <|> symName
+  (con, pos) <- withPos $ upperName <|> symName
   bs <- manyNested $ label "type constructor parameter" do
-    v <- lowerName
+    (v, pos') <- withPos lowerName
     ty <- annot containedExpr <|> return tyKind
-    return $  UAnnBinder (fromString v) ty
-  return (fromString con, bs)
+    return $ UAnnBinder (UBindSource (fromPos pos') v) ty
+  return (SourceNameWithPos (fromPos pos) con, bs)
   where tyKind = ns $ UPrimExpr $ TCExpr TypeKind
 
 -- TODO: dependent types
 dataConDef :: Parser (UConDef VoidS VoidS)
-dataConDef = (,) <$> upperName <*> manyNested dataConDefBinder
+-- dataConDef = (,) <$> upperName <*> manyNested dataConDefBinder
+dataConDef = do
+  (v, pos) <- withPos upperName
+  bs <- manyNested dataConDefBinder
+  return (SourceNameWithPos (fromPos pos) v, bs)
 
 dataConDefBinder :: Parser (UAnnBinder AtomNameC VoidS VoidS)
 dataConDefBinder = annBinder <|> (UAnnBinder UIgnore <$> containedExpr)
@@ -350,22 +353,24 @@ decl = do
 
 instanceDef :: Bool -> Parser (UDecl VoidS VoidS)
 instanceDef isNamed = do
-  name <- case isNamed of
-    False -> keyWord InstanceKW $> NothingB
-    True  -> keyWord NamedInstanceKW *> (JustB . fromString <$> anyName) <* sym ":"
+  name <- if isNamed
+    then keyWord InstanceKW $> NothingB
+    else do
+      (n, pos) <- keyWord NamedInstanceKW *> withPos anyName
+      JustB (UBindSource (fromPos pos) n) <$ sym ":"
   argBinders <- concat <$> many
     (argInParens [parensExplicitArg, parensImplicitArg, parensIfaceArg] <?> "instance arg")
-  className <- upperName
+  (className, pos) <- withPos upperName
   params <- many leafExpr
   methods <- onePerLine instanceMethod
-  return $ UInstance (fromString className) (toNestParsed argBinders) params methods name
+  return $ UInstance (fromPosAndString pos className) (toNestParsed argBinders) params methods name
 
 instanceMethod :: Parser (UMethodDef VoidS)
 instanceMethod = do
-  v <- anyName
+  (v, pos) <- withPos anyName
   sym "="
   rhs <- blockOrExpr
-  return $ UMethodDef (fromString v) rhs
+  return $ UMethodDef (fromPosAndString pos v) rhs
 
 simpleLet :: Parser (UExpr VoidS -> UDecl VoidS VoidS)
 simpleLet = label "let binding" $ do
@@ -441,14 +446,23 @@ effects = braces someEffects <|> return Pure
   where
     someEffects = do
       effs <- effect `sepBy` sym ","
-      v <- optional $ symbol "|" >> lowerName
-      return $ EffectRow (S.fromList effs) $ fmap fromString v
+      v <- optional (withPos (symbol "|" >> lowerName))
+      case v of
+        Nothing ->
+          return $ EffectRow (S.fromList effs) Nothing
+        Just (v', pos) ->
+          return $ EffectRow (S.fromList effs) (Just (SourceName (fromPos pos) v'))
 
 effect :: Parser (UEffect VoidS)
-effect =   (RWSEffect <$> rwsName <*> (Just <$> fromString <$> anyCaseName))
-       <|> (keyWord ExceptKW $> ExceptionEffect)
-       <|> (keyWord IOKW     $> IOEffect)
-       <?> "effect (Accum h | Read h | State h | Except | IO)"
+effect =
+  ( do
+      rws <- rwsName
+      (v, pos') <- withPos anyCaseName
+      pure (RWSEffect rws (Just (SourceName (fromPos pos') v)))
+  )
+    <|> (keyWord ExceptKW $> ExceptionEffect)
+    <|> (keyWord IOKW $> IOEffect)
+    <?> "effect (Accum h | Read h | State h | Except | IO)"
 
 rwsName :: Parser RWS
 rwsName =   (keyWord WriteKW $> Writer)
@@ -468,26 +482,26 @@ uLamExpr = do
 
 -- TODO Does this generalize?  Swap list for Nest?
 buildLam :: [UPatAnnArrow VoidS VoidS] -> UExpr VoidS -> UExpr VoidS
-buildLam binders body@(WithSrcE pos _) = case binders of
+buildLam binders body@(WithSrcE ctx _) = case binders of
   [] -> body
   -- TODO: join with source position of binders too
-  (UPatAnnArrow b arr):bs -> WithSrcE (joinPos pos' pos) $ ULam lam
-     where UPatAnn (WithSrcB pos' _) _ = b
+  (UPatAnnArrow b arr):bs -> WithSrcE (joinSrcPosCtx ctx' ctx) $ ULam lam
+     where UPatAnn (WithSrcB ctx' _) _ = b
            lam = ULamExpr arr b $ buildLam bs body
 
 buildTabLam :: [UPatAnn VoidS VoidS] -> UExpr VoidS -> UExpr VoidS
-buildTabLam binders body@(WithSrcE pos _) = case binders of
+buildTabLam binders body@(WithSrcE ctx _) = case binders of
   [] -> body
   -- TODO: join with source position of binders too
-  b:bs -> WithSrcE (joinPos pos' pos) $ UTabLam lam
-   where UPatAnn (WithSrcB pos' _) _ = b
+  b:bs -> WithSrcE (joinSrcPosCtx ctx ctx') $ UTabLam lam
+   where UPatAnn (WithSrcB ctx' _) _ = b
          lam = UTabLamExpr b $ buildTabLam bs body
 
 -- TODO Does this generalize?  Swap list for Nest?
 buildFor :: SrcPos -> Direction -> [UPatAnn VoidS VoidS] -> UExpr VoidS -> UExpr VoidS
 buildFor pos dir binders body = case binders of
   [] -> body
-  b:bs -> WithSrcE (Just pos) $ UFor dir $ UForExpr b $ buildFor pos dir bs body
+  b:bs -> WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ UFor dir $ UForExpr b $ buildFor pos dir bs body
 
 uViewExpr :: Parser (UExpr VoidS)
 uViewExpr = do
@@ -513,11 +527,11 @@ uForExpr = do
 unitExpr :: UExpr' VoidS
 unitExpr = UPrimExpr $ ConExpr $ ProdCon []
 
-ns :: (a n) -> WithSrcE a n
-ns = WithSrcE Nothing
+ns :: a n -> WithSrcE a n
+ns = WithSrcE (SrcPosCtx Nothing Nothing MiscSpanInfo)
 
-nsB :: (b n l) -> WithSrcB b n l
-nsB = WithSrcB Nothing
+nsB :: b n l -> WithSrcB b n l
+nsB = WithSrcB (SrcPosCtx Nothing Nothing MiscSpanInfo)
 
 blockOrExpr :: Parser (UExpr VoidS)
 blockOrExpr =  block <|> expr
@@ -543,7 +557,7 @@ block = withIndent $ do
 wrapUStatements :: [UStatement VoidS VoidS] -> UExpr VoidS
 wrapUStatements statements = case statements of
   [(RightB (LiftB e), _)] -> e
-  (s, pos):rest -> WithSrcE (Just pos) $ case s of
+  (s, pos):rest -> WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ case s of
     LeftB  d -> UDecl $ UDeclExpr d $ wrapUStatements rest
     RightB (LiftB e) -> UDecl $ UDeclExpr d $ wrapUStatements rest
       where d = ULet PlainLet (UPatAnn (nsB UPatIgnore) Nothing) e
@@ -566,9 +580,9 @@ uPiType = withSrc do
     piBinderPat = do
       UAnnBinder b ty@(WithSrcE pos _) <- annBinder
       return case b of
-        UBindSource n -> (UPatAnn (WithSrcB pos (fromString n))       (Just ty))
-        UIgnore       -> (UPatAnn (WithSrcB pos (UPatBinder UIgnore)) (Just ty))
-        UBind _ _     -> error "Shouldn't have UBind at parsing stage"
+        UBindSource _ n -> (UPatAnn (WithSrcB pos (fromString n))       (Just ty))
+        UIgnore         -> (UPatAnn (WithSrcB pos (UPatBinder UIgnore)) (Just ty))
+        UBind {}        -> error "Shouldn't have UBind at parsing stage"
 
 annBinder :: Parser (UAnnBinder (c::C) VoidS VoidS)
 annBinder = try $ namedBinder <|> anonBinder
@@ -647,7 +661,8 @@ leafPat = nextChar >>= \case
   '[' -> withSrcB $ brackets $ UPatTable <$> toNestParsed <$> leafPat `sepBy` sym ","
   _ -> withSrcB $ (UPatBinder <$> uBinder)
               <|> (UPatCon    <$> (fromString <$> upperName) <*> manyNested pat)
-  where pun pos l = WithSrcB (Just pos) $ fromString l
+  -- where pun pos l = WithSrcB (Just pos) $ fromString l
+  where pun pos l = WithSrcB (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ fromString l
         variantPat = parseVariant leafPat UPatVariant UPatVariantLift
         recordPat = (UPatRecord UEmptyRowPat <$ braces (return ())) `fallBackTo`
                     (UPatRecord <$> parseFieldRowPat "," "=" (Just pun))
@@ -707,7 +722,7 @@ uLabeledExprs = withSrc $
     build sep bindwith prefixParser = parseLabeledItems sep bindwith prefixParser expr
 
 varPun :: SrcPos -> Label -> (UExpr VoidS)
-varPun pos str = WithSrcE (Just pos) $ UVar (fromString str)
+varPun pos str = WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ UVar (fromString str)
 
 uDoSugar :: Parser (UExpr VoidS)
 uDoSugar = withSrc $ do
@@ -836,15 +851,15 @@ parseFieldRowElems sep bindwith itemparser punner =
       return $ e : rest
     dynField = do
       try $ void $ char '@'
-      v <- anyName
+      (v, pos) <- withPos anyName
       symbol bindwith
       rhs <- itemparser
-      return $ UDynField (SourceName v) rhs
+      return $ UDynField (SourceName (SrcPosCtx (Just pos) Nothing MiscSpanInfo) v) rhs
     dynFields = do
       try $ symbol "..."
       UDynFields <$> expr
     staticFields = do
-      (l, pos) <- withPos $ fieldLabel
+      (l, pos) <- withPos fieldLabel
       let explicitBound = symbol bindwith *> itemparser
       rhs <- case punner of
         Just p  -> explicitBound <|> pure (p pos l)
@@ -871,17 +886,17 @@ parseFieldRowPat sep bindwith punner =
       return $ e rest
     dynFields = do
       void $ string "@..."
-      v <- anyName
+      (v, pos) <- withPos anyName
       symbol bindwith
       rhs <- leafPat
-      return $ UDynFieldsPat (SourceName v) rhs
+      return $ UDynFieldsPat (SourceName (SrcPosCtx (Just pos) Nothing MiscSpanInfo) v) rhs
     dynField :: Parser (UFieldRowPat VoidS VoidS -> UFieldRowPat VoidS VoidS)
     dynField = do
       try $ void $ char '@'
-      v <- anyName
+      (v, pos) <- withPos anyName
       symbol bindwith
       rhs <- leafPat
-      return $ UDynFieldPat (SourceName v) rhs
+      return $ UDynFieldPat (SourceName (SrcPosCtx (Just pos) Nothing MiscSpanInfo) v) rhs
     remFields :: Parser (UFieldRowPat VoidS VoidS)
     remFields = do
       try $ symbol "..."
@@ -1011,22 +1026,36 @@ pairingSymOpP s = opWithSrc $ do
 prefixNegOp :: Operator Parser (UExpr VoidS)
 prefixNegOp = Prefix $ label "negation" $ do
   ((), pos) <- withPos $ sym "-"
-  return \(WithSrcE litpos e) -> do
-    let pos' = joinPos (Just pos) litpos
-    case e of
-      UNatLit   i -> WithSrcE pos' $ UIntLit   (-(fromIntegral i))
-      UIntLit   i -> WithSrcE pos' $ UIntLit   (-i)
-      UFloatLit i -> WithSrcE pos' $ UFloatLit (-i)
-      _ -> do
-        let f = WithSrcE (Just pos) "neg"
-        mkApp f $ WithSrcE litpos e
+  -- return \(WithSrcE litpos e) -> do
+  --   let pos' = joinPos (Just pos) litpos
+  --   case e of
+  --     UNatLit   i -> WithSrcE pos' $ UIntLit   (-(fromIntegral i))
+  --     UIntLit   i -> WithSrcE pos' $ UIntLit   (-i)
+  --     UFloatLit i -> WithSrcE pos' $ UFloatLit (-i)
+  --     _ -> do
+  --       let f = WithSrcE (Just pos) "neg"
+  --       mkApp f $ WithSrcE litpos e
+  let f = WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) (mkVar "neg" pos)
+  -- let f = WithSrcE (SrcPosCtx (Just pos) Nothing) "neg"
+  -- let f = WithSrcE (SrcPosCtx (Just pos) Nothing) (mkVar "neg" pos)
+  -- let f = WithSrcE (SrcPosCtx (Just pos) Nothing) "neg"
+  -- let f = WithSrcE (Just pos) (mkVar "neg" pos)
+  return \case
+    -- Special case: negate literals directly
+    WithSrcE (SrcPosCtx litpos spanId spanInfo) (UIntLit i)
+      -> WithSrcE (SrcPosCtx (joinPos (Just pos) litpos) spanId spanInfo) (UIntLit (-i))
+    WithSrcE (SrcPosCtx litpos spanId spanInfo) (UFloatLit i)
+      -> WithSrcE (SrcPosCtx (joinPos (Just pos) litpos) spanId spanInfo) (UFloatLit (-i))
+    x -> mkApp f x
 
 prefixPosOp :: Operator Parser (UExpr VoidS)
 prefixPosOp = Prefix $ label "positive" $ do
   ((), pos) <- withPos $ sym "+"
-  return \(WithSrcE litpos e) -> do
-    let pos' = joinPos (Just pos) litpos
-    WithSrcE pos' case e of
+  return \(WithSrcE litpos@(SrcPosCtx pos' spanId span) e) -> do
+    let pos'' = joinPos (Just pos) pos'
+    -- TODO(danielzheng): Fix.
+    -- WithSrcE (fromPos pos'') case e of
+    WithSrcE emptySrcPosCtx case e of
       UNatLit   i -> UIntLit   (fromIntegral i)
       UIntLit   i -> UIntLit   i
       UFloatLit i -> UFloatLit i
@@ -1034,7 +1063,12 @@ prefixPosOp = Prefix $ label "positive" $ do
 
 binApp :: SourceName -> SrcPos -> UExpr VoidS -> UExpr VoidS -> UExpr VoidS
 binApp f pos x y = (f' `mkApp` x) `mkApp` y
-  where f' = WithSrcE (Just pos) $ fromString f
+  where f' = WithSrcE (fromPos pos) (mkVar f pos)
+  -- where f' = WithSrcE (SrcPosCtx (Just pos) Nothing) $ fromString f
+  -- where f' = WithSrcE (Just pos) (mkVar f pos)
+
+mkVar :: String -> SrcPos -> UExpr' VoidS
+mkVar s pos = UVar (SourceName (SrcPosCtx (Just pos) Nothing MiscSpanInfo) s)
 
 mkApp :: UExpr (n::S) -> UExpr n -> UExpr n
 mkApp f x = joinSrc f x $ UApp f x
@@ -1046,31 +1080,42 @@ infixArrow :: Parser (UType VoidS -> UType VoidS -> UType VoidS)
 infixArrow = do
   notFollowedBy (sym "=>")  -- table arrows have special fixity
   ((arr, eff), pos) <- withPos arrow
-  return \a b -> WithSrcE (Just pos) $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) (fromMaybe Pure eff) b
+  -- return \a b -> WithSrcE (Just pos) $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) (fromMaybe Pure eff) b
+  return \a b -> WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) (fromMaybe Pure eff) b
+  -- return \a b -> WithSrcE (SrcPosCtx (Just pos) Nothing) $ UPi $ UPiExpr arr (UPatAnn (nsB UPatIgnore) (Just a)) (fromMaybe Pure eff) b
 
 mkTabType :: UExpr VoidS -> UExpr VoidS -> UExpr VoidS
 mkTabType a b = joinSrc a b $ UTabPi $ UTabPiExpr (UPatAnn (nsB UPatIgnore) (Just a)) b
 
+fromPosAndString :: SrcPos -> String -> SourceNameOr a VoidS
+fromPosAndString pos = SourceName (SrcPosCtx (Just pos) Nothing MiscSpanInfo)
+
 withSrc :: Parser (a n) -> Parser (WithSrcE a n)
 withSrc p = do
   (x, pos) <- withPos p
-  return $ WithSrcE (Just pos) x
+  return $ WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) x
 
 withSrcB :: Parser (b n l) -> Parser (WithSrcB b n l)
 withSrcB p = do
   (x, pos) <- withPos p
-  return $ WithSrcB (Just pos) x
+  return $ WithSrcB (SrcPosCtx (Just pos) Nothing MiscSpanInfo) x
 
 joinSrc :: WithSrcE a1 n1 -> WithSrcE a2 n2 -> a3 n3 -> WithSrcE a3 n3
-joinSrc (WithSrcE p1 _) (WithSrcE p2 _) x = WithSrcE (joinPos p1 p2) x
+joinSrc (WithSrcE ctx1 _) (WithSrcE ctx2 _) = WithSrcE (joinSrcPosCtx ctx1 ctx2)
 
 joinSrcB :: WithSrcB a1 n1 l1 -> WithSrcB a2 n2 l2 -> a3 n3 l3 -> WithSrcB a3 n3 l3
-joinSrcB (WithSrcB p1 _) (WithSrcB p2 _) x = WithSrcB (joinPos p1 p2) x
+joinSrcB (WithSrcB ctx1 _) (WithSrcB ctx2 _) = WithSrcB (joinSrcPosCtx ctx1 ctx2)
 
 joinPos :: Maybe SrcPos -> Maybe SrcPos -> Maybe SrcPos
 joinPos Nothing p = p
 joinPos p Nothing = p
 joinPos (Just (l, h)) (Just (l', h')) = Just (min l l', max h h')
+
+joinSpanInfo :: SpanInfo -> SpanInfo -> SpanInfo
+joinSpanInfo _ i' = i'
+
+joinSrcPosCtx :: SrcPosCtx -> SrcPosCtx -> SrcPosCtx
+joinSrcPosCtx (SrcPosCtx p _ info) (SrcPosCtx p' _ info') = SrcPosCtx (joinPos p p') Nothing (joinSpanInfo info info')
 
 indexRangeOps :: [Operator Parser (UExpr VoidS)]
 indexRangeOps =
@@ -1081,7 +1126,7 @@ indexRangeOps =
   , InfixL    $ symPos "..<"  <&> \pos l h -> range pos (InclusiveLim l) (ExclusiveLim h)
   , InfixL    $ symPos "<..<" <&> \pos l h -> range pos (ExclusiveLim l) (ExclusiveLim h) ]
   where
-    range pos l h = WithSrcE (Just pos) $ UIndexRange l h
+    range pos l h = WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ UIndexRange l h
     symPos s = snd <$> withPos (sym s)
 
 limFromMaybe :: Maybe a -> Limit a
@@ -1090,7 +1135,8 @@ limFromMaybe (Just x) = InclusiveLim x
 
 annotatedExpr :: Operator Parser (UExpr VoidS)
 annotatedExpr = InfixL $ opWithSrc $
-  sym "::" $> (\pos v ty -> WithSrcE (Just pos) $ UTypeAnn v ty)
+  -- sym "::" $> (\pos v ty -> WithSrcE (Just pos) $ UTypeAnn v ty)
+  sym "::" $> (\pos v ty -> WithSrcE (SrcPosCtx (Just pos) Nothing MiscSpanInfo) $ UTypeAnn v ty)
 
 inpostfix :: Parser (UExpr VoidS -> Maybe (UExpr VoidS) -> UExpr VoidS)
           -> Operator Parser (UExpr VoidS)

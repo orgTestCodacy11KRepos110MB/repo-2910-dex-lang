@@ -31,19 +31,26 @@ import Data.Word
 import GHC.Generics (Generic (..))
 import Data.Store (Store (..))
 
-import Name
 import Err
 import LabeledItems
+import Name
 import Util (File (..))
 
 import Types.Primitives
+    ( LetAnn, Arrow, EffectRowP, EffectP, Limit, Direction, PrimExpr )
+
+data SourceNameWithPos = SourceNameWithPos SrcPosCtx SourceName
+  deriving (Show, Eq, Ord, Generic)
+
+instance HasNameHint SourceNameWithPos where
+  getNameHint (SourceNameWithPos _ name) = getNameHint name
 
 data SourceNameOr (a::E) (n::S) where
   -- Only appears before renaming pass
-  SourceName :: SourceName -> SourceNameOr a VoidS
+  SourceName :: SrcPosCtx -> SourceName -> SourceNameOr a VoidS
   -- Only appears after renaming pass
   -- We maintain the source name for user-facing error messages.
-  InternalName :: SourceName -> a n -> SourceNameOr a n
+  InternalName :: SrcPosCtx -> SourceName -> a n -> SourceNameOr a n
 deriving instance Eq (a n) => Eq (SourceNameOr (a::E) (n::S))
 deriving instance Ord (a n) => Ord (SourceNameOr a n)
 deriving instance Show (a n) => Show (SourceNameOr a n)
@@ -64,12 +71,13 @@ data UVar (n::S) =
 
 data UBinder (c::C) (n::S) (l::S) where
   -- Only appears before renaming pass
-  UBindSource :: SourceName -> UBinder c n n
+  -- TODO(danielzheng): Add SrcPosCtx to UBindSource
+  UBindSource :: SrcPosCtx -> SourceName -> UBinder c n n
   -- May appear before or after renaming pass
   UIgnore :: UBinder c n n
   -- The following binders only appear after the renaming pass.
   -- We maintain the source name for user-facing error messages.
-  UBind :: SourceName -> NameBinder c n l -> UBinder c n l
+  UBind :: SrcPosCtx -> SourceName -> NameBinder c n l -> UBinder c n l
 
 type UExpr = WithSrcE UExpr'
 data UExpr' (n::S) =
@@ -123,15 +131,18 @@ data UTabPiExpr (n::S) where
 data UDeclExpr (n::S) where
   UDeclExpr :: UDecl n l -> UExpr l -> UDeclExpr n
 
-type UConDef (n::S) (l::S) = (SourceName, Nest (UAnnBinder AtomNameC) n l)
+-- type UConDef (n::S) (l::S) = (SourceName, Nest (UAnnBinder AtomNameC) n l)
+type UConDef (n::S) (l::S) = (SourceNameWithPos, Nest (UAnnBinder AtomNameC) n l)
 
 -- TODO Why are the type and data constructor names SourceName, rather
 -- than being scoped names of the proper color of their own?
 data UDataDef (n::S) where
   UDataDef
-    :: (SourceName, Nest (UAnnBinder AtomNameC) n l')    -- param binders
+    -- :: (SourceName, Nest (UAnnBinder AtomNameC) n l')    -- param binders
+    :: (SourceNameWithPos, Nest (UAnnBinder AtomNameC) n l')    -- param binders
     -> Nest (UAnnBinder AtomNameC) l' l  -- typeclass binders
-    -> [(SourceName, UDataDefTrail l)] -- data constructor types
+    -- -> [(SourceName, UDataDefTrail l)] -- data constructor types
+    -> [(SourceNameWithPos, UDataDefTrail l)] -- data constructor types
     -> UDataDef n
 
 data UDataDefTrail (l::S) where
@@ -239,6 +250,12 @@ data SourceMap (n::S) = SourceMap
   {fromSourceMap :: M.Map SourceName [SourceNameDef n]}
   deriving Show
 
+{-
+data SourceMapWithInfo (n::S) = SourceMapWithInfo
+  {fromSourceMapWithInfo :: M.Map SourceName [(SourceNameDef n, SpanInfo)]}
+  deriving Show
+-}
+
 -- === Source modules ===
 
 data ModuleSourceName = Prelude | Main | OrdinaryModule SourceName
@@ -271,6 +288,8 @@ data SourceBlock = SourceBlock
 
 type ReachedEOF = Bool
 
+-- NOTE: These are all the cases for top-level blocks.
+-- Interesting ones: EvalUDecl, Command.
 data SourceBlock' =
    EvalUDecl (UDecl VoidS VoidS)
  | Command CmdName (UExpr VoidS)
@@ -417,27 +436,27 @@ instance HasNameHint ModuleSourceName where
 
 instance Color c => HasNameHint (UBinder c n l) where
   getNameHint b = case b of
-    UBindSource v -> getNameHint v
-    UIgnore       -> noHint
-    UBind v _     -> getNameHint v
+    UBindSource _ v -> getNameHint v
+    UIgnore         -> noHint
+    UBind _ v _     -> getNameHint v
 
 instance Color c => BindsNames (UBinder c) where
-  toScopeFrag (UBindSource _) = emptyOutFrag
+  toScopeFrag (UBindSource _ _) = emptyOutFrag
   toScopeFrag (UIgnore)       = emptyOutFrag
-  toScopeFrag (UBind _ b)     = toScopeFrag b
+  toScopeFrag (UBind _ _ b)     = toScopeFrag b
 
 instance Color c => ProvesExt (UBinder c) where
 instance Color c => BindsAtMostOneName (UBinder c) c where
   b @> x = case b of
-    UBindSource _ -> emptyInFrag
-    UIgnore       -> emptyInFrag
-    UBind _ b'    -> b' @> x
+    UBindSource _ _ -> emptyInFrag
+    UIgnore         -> emptyInFrag
+    UBind _ _ b'    -> b' @> x
 
 uBinderSourceName :: UBinder c n l -> SourceName
 uBinderSourceName b = case b of
-  UBindSource v -> v
-  UIgnore       -> "_"
-  UBind v _     -> v
+  UBindSource _ v -> v
+  UIgnore         -> "_"
+  UBind _ v _     -> v
 
 instance Color c => ProvesExt (UAnnBinder c) where
 instance Color c => BindsNames (UAnnBinder c) where
@@ -474,11 +493,19 @@ instance Store (SourceMap n)
 
 instance Hashable ModuleSourceName
 
+instance Store SourceNameWithPos
+instance Hashable SourceNameWithPos
+
+{-
 instance IsString (SourceNameOr a VoidS) where
   fromString = SourceName
+-}
+
+instance IsString (SourceNameOr a VoidS) where
+  fromString = SourceName (SrcPosCtx Nothing Nothing MiscSpanInfo)
 
 instance IsString (UBinder s VoidS VoidS) where
-  fromString = UBindSource
+  fromString = UBindSource (SrcPosCtx Nothing Nothing MiscSpanInfo)
 
 instance IsString (UPat' VoidS VoidS) where
   fromString = UPatBinder . fromString
@@ -486,14 +513,19 @@ instance IsString (UPat' VoidS VoidS) where
 instance IsString (UPatAnn VoidS VoidS) where
   fromString s = UPatAnn (fromString s) Nothing
 
+{-
+instance IsString (UExpr' VoidS) where
+  fromString = UVar . fromString
+-}
+
 instance IsString (UExpr' VoidS) where
   fromString = UVar . fromString
 
 instance IsString (a n) => IsString (WithSrcE a n) where
-  fromString = WithSrcE Nothing . fromString
+  fromString = WithSrcE (SrcPosCtx Nothing Nothing MiscSpanInfo) . fromString
 
 instance IsString (b n l) => IsString (WithSrcB b n l) where
-  fromString = WithSrcB Nothing . fromString
+  fromString = WithSrcB (SrcPosCtx Nothing Nothing MiscSpanInfo) . fromString
 
 deriving instance Show (UBinder s n l)
 deriving instance Show (UDataDefTrail n)

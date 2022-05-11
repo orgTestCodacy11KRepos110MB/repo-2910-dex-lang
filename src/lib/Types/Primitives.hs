@@ -199,7 +199,6 @@ data EffectP (name::E) (n::S) =
   RWSEffect RWS (Maybe (name n)) | ExceptionEffect | IOEffect
   deriving (Show, Eq, Ord, Generic)
 
-
 data EffectRowP (name::E) (n::S) =
   EffectRow (S.Set (EffectP name n)) (Maybe (name n))
   deriving (Show, Eq, Ord, Generic)
@@ -323,17 +322,22 @@ getFloatLit l = case l of
 
 -- === Typeclass instances ===
 
+--  RWSEffect RWS (Maybe (SrcPosCtx, name n)) | ExceptionEffect | IOEffect
+--  RWSEffect RWS (Maybe (name n)) | ExceptionEffect | IOEffect
+
 instance GenericE (EffectP name) where
   type RepE (EffectP name) =
     EitherE (PairE (LiftE RWS) (MaybeE name))
             (LiftE (Either () ()))
   fromE = \case
-    RWSEffect rws name -> LeftE  (PairE (LiftE rws) $ toMaybeE name)
+    RWSEffect rws name ->
+      LeftE (PairE (LiftE rws) (toMaybeE name))
     ExceptionEffect -> RightE (LiftE (Left  ()))
     IOEffect        -> RightE (LiftE (Right ()))
   {-# INLINE fromE #-}
   toE = \case
-    LeftE  (PairE (LiftE rws) name) -> RWSEffect rws $ fromMaybeE name
+    LeftE (PairE (LiftE rws) name) ->
+      RWSEffect rws (fromMaybeE name)
     RightE (LiftE (Left  ())) -> ExceptionEffect
     RightE (LiftE (Right ())) -> IOEffect
   {-# INLINE toE #-}

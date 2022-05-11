@@ -5,7 +5,8 @@
 -- https://developers.google.com/open-source/licenses/bsd
 
 module Err (Err (..), Errs (..), ErrType (..), Except (..), ErrCtx (..),
-            SrcPosCtx, SrcTextCtx, SrcPos,
+            SpanInfo (..), SrcPosCtx (..), emptySrcPosCtx, fromPos,
+            SrcTextCtx, SrcPos, SpanId,
             Fallible (..), Catchable (..), catchErrExcept,
             FallibleM (..), HardFailM (..), CtxReader (..),
             runFallibleM, runHardFail, throw, throwErr,
@@ -25,10 +26,13 @@ import Control.Monad.Writer.Strict
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Data.Coerce
+import Data.Hashable
+import Data.Store (Store (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Prettyprint.Doc.Render.Text
 import Data.Text.Prettyprint.Doc
+import GHC.Generics (Generic (..))
 import GHC.Stack
 import System.Environment
 import System.IO.Unsafe
@@ -61,16 +65,92 @@ data ErrType = NoErr
              | MonadFailErr
                deriving (Show, Eq)
 
-type SrcPosCtx  = Maybe SrcPos
+{-
+-- TODO: Replace SrcPosCtx with this
+data SpanInfo = SpanInfo SrcPosCtx SpanInfo'
+data SpanInfo' =
+    MiscSpanInfo
+  | VarOccSpanInfo (Maybe SpanId) -- binder span id
+  | BinOccSpanInfo SpanId -- binder scope span id
+  -- binder -> [occurrence] mapping will be computed during post-processing
+  deriving (Show, Eq, Ord, Generic)
+-}
+
+data SpanInfo =
+    MiscSpanInfo
+  | VarOccSpanInfo (Maybe SpanId) -- binder span id
+  | BinOccSpanInfo SpanId -- binder scope span id
+  -- binder -> [occurrence] mapping will be computed during post-processing
+  deriving (Show, Eq, Ord, Generic)
+instance Hashable SpanInfo
+instance Store SpanInfo
+
+-- type SrcPosCtx  = Maybe SrcPos
+-- TODO(danielzheng): Consider renaming to "span id".
+type SpanId = Int
+-- type SrcPosCtx  = (Maybe SrcPos, Maybe SpanId)
+-- data SrcPosCtx  = SrcPosCtx
+--   { srcPosCtxSrcPos :: Maybe SrcPos
+--   , srcPosCtxExprId :: Maybe SpanId }
+--   deriving (Show, Eq, Generic)
+data SrcPosCtx = SrcPosCtx (Maybe SrcPos) (Maybe SpanId) SpanInfo
+  -- deriving (Show, Eq, Ord, Generic)
+  deriving (Show, Eq, Generic)
+instance Hashable SrcPosCtx
+instance Store SrcPosCtx
+
+{-
+instance Ord SrcPosCtx where
+  compare (SrcPosCtx pos spanId spanInfo) (SrcPosCtx pos' spanId' spanInfo') =
+    case (pos, pos') of
+      (Just (l, r), Just (l', r')) -> compare (l, r', spanId) (l', r, spanId')
+      (Just _, _) -> GT
+      (_, Just _) -> LT
+      (_, _) -> compare spanId spanId'
+-}
+
+instance Ord SrcPosCtx where
+  compare (SrcPosCtx pos spanId spanInfo) (SrcPosCtx pos' spanId' spanInfo') =
+    case (pos, pos') of
+      (Just (l, r), Just (l', r')) -> compare (l, r', spanId, spanInfo) (l', r, spanId', spanInfo')
+      (Just _, _) -> GT
+      (_, Just _) -> LT
+      (_, _) -> compare (spanId, spanInfo) (spanId', spanInfo')
+
+emptySrcPosCtx :: SrcPosCtx
+emptySrcPosCtx = SrcPosCtx Nothing Nothing MiscSpanInfo
+
+fromPos :: SrcPos -> SrcPosCtx
+fromPos pos = SrcPosCtx (Just pos) Nothing MiscSpanInfo
+
 type SrcTextCtx = Maybe (Int, Text) -- Int is the offset in the source file
 data ErrCtx = ErrCtx
   { srcTextCtx :: SrcTextCtx
   , srcPosCtx  :: SrcPosCtx
   , messageCtx :: [String]
   , stackCtx   :: Maybe [String] }
-    deriving (Show, Eq)
+    deriving (Show, Eq, Generic)
 
+-- Note: we could add more information to SrcPos in support of hovertips.
+-- Example: add "id".
+-- Question: which pass would add these ids?
+-- - Parser - monad already has backtracking/errors, interaction between state
+--   and errors could be tricky. Need to change Parser monad and "withPos"
+--   primitive.
+-- - A new pass over UExpr
 type SrcPos = (Int, Int)
+
+-- Options:
+-- 1. Keep expression id in SrcPos, make parser function monadic
+-- 2. Separate expression id from SrcPos
+-- data SrcPos = SrcPos
+--   { srcPosStart :: Int
+--   , srcPosEnd :: Int
+--   , srcPosExprId :: Int }
+--     deriving (Show, Eq, Generic)
+--
+-- instance Store SrcPos
+-- instance Hashable SrcPos
 
 class MonadFail m => Fallible m where
   throwErrs :: Errs -> m a
@@ -426,7 +506,7 @@ instance Pretty Err where
   pretty (Err e ctx s) = pretty e <> pretty s <> prettyCtx
     -- TODO: figure out a more uniform way to newlines
     where prettyCtx = case ctx of
-            ErrCtx _ Nothing [] Nothing -> mempty
+            ErrCtx _ (SrcPosCtx Nothing _ _) [] Nothing -> mempty
             _ -> hardline <> pretty ctx
 
 instance Pretty ErrCtx where
@@ -437,7 +517,7 @@ instance Pretty ErrCtx where
     prettyLines (reverse messages) <> highlightedSource <> prettyStack
     where
       highlightedSource = case (maybeTextCtx, maybePosCtx) of
-        (Just (offset, text), Just (start, stop)) ->
+        (Just (offset, text), SrcPosCtx (Just (start, stop)) _ _) ->
            hardline <> pretty (highlightRegion (start - offset, stop - offset) text)
         _ -> mempty
       prettyStack = case stack of
@@ -514,14 +594,27 @@ instance CtxReader m => CtxReader (StateT s m) where
   getErrCtx = lift getErrCtx
   {-# INLINE getErrCtx #-}
 
+instance Semigroup SpanInfo where
+  _ <> x' = x'
+  -- x <> x' = case (x, x') of
+  --   (MiscSpanInfo, MiscSpanInfo) -> _
+  --   (VarOccSpanInfo m_n, VarOccSpanInfo m_n) -> _
+  --   (BinOccSpanInfo n, BinOccSpanInfo n) -> _
+
 instance Semigroup ErrCtx where
-  ErrCtx text pos ctxStrs stk <> ErrCtx text' pos' ctxStrs' stk' =
+  -- ErrCtx text pos@(SrcPosCtx p spanId) ctxStrs stk <> ErrCtx text' pos'@(SrcPosCtx p' spanId') ctxStrs' stk' =
+  ErrCtx text (SrcPosCtx p spanId spanInfo) ctxStrs stk <> ErrCtx text' (SrcPosCtx p' spanId' spanInfo') ctxStrs' stk' =
     ErrCtx (leftmostJust  text text')
-           (rightmostJust pos  pos' )
+           (SrcPosCtx
+            (rightmostJust p p')
+            (rightmostJust spanId spanId')
+            (spanInfo <> spanInfo')
+            )
            (ctxStrs <> ctxStrs')
            (leftmostJust stk stk')  -- We usually extend errors form the right
+
 instance Monoid ErrCtx where
-  mempty = ErrCtx Nothing Nothing [] Nothing
+  mempty = ErrCtx Nothing (SrcPosCtx Nothing Nothing MiscSpanInfo) [] Nothing
 
 -- === misc util stuff ===
 

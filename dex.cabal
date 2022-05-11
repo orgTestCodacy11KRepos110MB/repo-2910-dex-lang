@@ -78,6 +78,7 @@ library
                      , Syntax
                      , TopLevel
                      , Transpose
+                     , TraverseContexts
                      , Types.Core
                      , Types.Imp
                      , Types.Primitives
@@ -298,8 +299,11 @@ test-suite spec
   build-depends:       base
                      , hspec
                      , QuickCheck
+                     , mtl
+                     , blaze-html
                      , dex
   other-modules:       RawNameSpec
+                     , UtilSpec
   default-language:    Haskell2010
   build-tool-depends:  hspec-discover:hspec-discover
                        -- Mimicking -XGHC2021 in GHC 8.10.1

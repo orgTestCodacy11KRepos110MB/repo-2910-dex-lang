@@ -106,3 +106,7 @@ code {
 .iso-sugar {
   color: #25BBA7;
 }
+
+.code-span-leaf:hover {
+  background-color: #ffff00;
+}
